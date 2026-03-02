@@ -22,92 +22,162 @@ Then proceed through all phases automatically. Ask for help only when genuinely 
 
 ---
 
-## Phase 1 — Extract Auth Token
+## Phase 1 — Identify the Auth System
 
-Scan both localStorage and cookies across all browsers and profiles on this machine.
+The goal of this phase is to name the auth system before touching browser storage.
+Knowing the system tells you exactly where credentials live, how long they last,
+and what refresh strategy to use. Do not scan browser storage blind.
 
-### 1a — localStorage (LevelDB)
+### 1a — Identify the auth system from the JS bundle
 
-Chromium stores localStorage as LevelDB at:
-- macOS: `~/Library/Application Support/{browser}/{profile}/Local Storage/leveldb/`
-- Linux: `~/.config/{browser}/{profile}/Local Storage/leveldb/`
-- Windows: `%LOCALAPPDATA%/{browser}/User Data/{profile}/Local Storage/leveldb/`
+Fetch the page and find the main JS bundle(s):
 
-Copy the directory to /tmp before reading (browser locks it while open).
-Use the `classic-level` npm package to iterate all entries.
-Filter for keys matching the exact origin: `_https://the-site.com\x00\x01*`
-Strip the leading `\x01` byte from every value (Chromium's internal type prefix).
+```bash
+curl -s https://the-site.com | grep -oE 'src="[^"]*\.js[^"]*"' | head -20
+```
 
-Look for values that are:
-- JWTs (start with `eyJ` in base64)
-- Long opaque strings that look like tokens (>32 chars)
-- UUIDs used as session identifiers
+Download the largest bundle(s) and search for auth fingerprints:
 
-Note the key names — they reveal the auth scheme:
-- `CognitoIdentityServiceProvider.*` → AWS Cognito
-- `firebase:authUser:*` → Firebase Auth
-- Keys containing `token`, `auth`, `session`, `access`, `refresh`, `id`
+```bash
+# Auth library imports
+grep -oE "(aws-amplify|@aws-amplify|amazon-cognito-identity|firebase[/\"]auth|@auth0|okta-auth|supabase|clerk)" bundle.js | sort -u
 
-### 1b — Cookies (SQLite)
+# Auth config objects (Cognito pool IDs, Firebase config)
+grep -oE '"UserPoolId"\s*:\s*"[^"]+"' bundle.js
+grep -oE '"IdentityPoolId"\s*:\s*"[^"]+"' bundle.js
+grep -oE '"authDomain"\s*:\s*"[^"]+"' bundle.js   # Firebase
+grep -oE '"projectId"\s*:\s*"[^"]+"' bundle.js    # Firebase
 
-Chromium stores cookies at:
-- macOS: `~/Library/Application Support/{browser}/{profile}/Cookies`
-- Linux: `~/.config/{browser}/{profile}/Cookies`
-- Windows: `%LOCALAPPDATA%/{browser}/User Data/{profile}/Network/Cookies`
+# Auth endpoint URLs
+grep -oE 'cognito-idp\.[a-z0-9-]+\.amazonaws\.com' bundle.js
+grep -oE 'securetoken\.googleapis\.com' bundle.js
+grep -oE '/oauth[2]?/token' bundle.js
+grep -oE '/auth/login|/api/auth|/v[0-9]/auth' bundle.js
+```
 
-Firefox stores cookies at:
-- macOS: `~/Library/Application Support/Firefox/Profiles/*default*/cookies.sqlite`
-- Linux: `~/.mozilla/firefox/*default*/cookies.sqlite`
-- Windows: `%APPDATA%/Mozilla/Firefox/Profiles/*default*/cookies.sqlite`
+**Match findings to auth system:**
 
-Copy to /tmp before reading. Query:
+| Signal | Auth system | Tokens in | Expiry |
+|--------|-------------|-----------|--------|
+| `cognito-idp.*.amazonaws.com` or `UserPoolId` | AWS Cognito | localStorage | idToken 1hr, refreshToken 30d |
+| `securetoken.googleapis.com` or `authDomain` | Firebase Auth | localStorage | idToken 1hr |
+| `@auth0` or `auth0.com` in URLs | Auth0 | localStorage or cookies | varies |
+| `/oauth2/token` with `client_id` | OAuth2 / custom | varies | varies |
+| No auth library found | Custom session | cookies | varies |
+
+**Stop here and state:** "This site uses [auth system]." Then proceed to the matching
+extraction section below. Skip sections that don't apply.
+
+---
+
+### 1b — Extraction: AWS Cognito
+
+Tokens are in localStorage. Read via LevelDB:
+
+```bash
+# Browsers and profiles to check
+# macOS: ~/Library/Application Support/{browser}/{profile}/Local Storage/leveldb/
+# Linux: ~/.config/{browser}/{profile}/Local Storage/leveldb/
+# Browsers: Google/Chrome, Arc/User Data, BraveSoftware/Brave-Browser, Microsoft Edge,
+#            Chromium, Vivaldi, Opera Software/Opera Stable
+# Profiles: Default, Profile 1, Profile 2, Profile 3
+```
+
+Copy the leveldb dir to /tmp (browser holds a lock). Use `classic-level` to iterate:
+
+```typescript
+import { ClassicLevel } from 'classic-level';
+const db = new ClassicLevel('/tmp/leveldb-copy', { valueEncoding: 'buffer' });
+for await (const [key, value] of db.iterator()) {
+  const k = key.toString();
+  if (k.includes('CognitoIdentityServiceProvider')) {
+    // strip leading \x01 byte (Chromium type prefix)
+    console.log(k, value.slice(1).toString());
+  }
+}
+```
+
+Keys follow the pattern `CognitoIdentityServiceProvider.<ClientId>.<username>.<tokenType>`.
+Extract: `idToken`, `accessToken`, `refreshToken`, `LastAuthUser`.
+The `ClientId` is the string between the first and second dots — you'll need it for refresh.
+
+**What to use in API calls:** test `idToken` first (Authorization: Bearer), then `accessToken`.
+
+---
+
+### 1c — Extraction: Firebase Auth
+
+Tokens are in localStorage under `firebase:authUser:<apiKey>:<projectId>`.
+
+Same LevelDB read approach as 1b. Filter for keys starting with `firebase:authUser`.
+The value is a JSON object — extract `.stsTokenManager.accessToken` and `.stsTokenManager.refreshToken`.
+
+**What to use in API calls:** `Authorization: Bearer <accessToken>`
+
+---
+
+### 1d — Extraction: Session Cookies
+
+Cookies are the credential. No localStorage needed.
+
+**Chromium** stores cookies as SQLite:
+```
+macOS: ~/Library/Application Support/{browser}/{profile}/Cookies
+Linux: ~/.config/{browser}/{profile}/Cookies
+Windows: %LOCALAPPDATA%/{browser}/User Data/{profile}/Network/Cookies
+```
+
+Copy to /tmp, then query:
 ```sql
 SELECT name, value, encrypted_value, host_key
 FROM cookies
 WHERE host_key LIKE '%.domain.com' OR host_key = 'domain.com'
 ```
 
-For Chromium browsers, values are AES-128-CBC encrypted:
-- macOS: get master password via `security find-generic-password -s "{Browser} Safe Storage" -w`
-- Linux: password is usually `"peanuts"` (default) or from libsecret
-- Derive key: PBKDF2-SHA1(password, salt=`"saltysalt"`, iterations=1003, keylen=16)
-- Decrypt: strip the `"v10"` prefix, use 16 null bytes as IV
+Chromium encrypts values with AES-128-CBC:
+- macOS master key: `security find-generic-password -s "{Browser} Safe Storage" -w`
+- Linux master key: usually `"peanuts"` (or from libsecret/kwallet)
+- Derive: PBKDF2-SHA1(masterKey, salt=`"saltysalt"`, iterations=1003, keylen=16)
+- Decrypt: strip `"v10"` prefix, IV = 16 null bytes
 
-Firefox cookies are plaintext — no decryption needed.
+**Firefox** stores cookies as plaintext SQLite at:
+```
+macOS: ~/Library/Application Support/Firefox/Profiles/*.default*/cookies.sqlite
+Linux: ~/.mozilla/firefox/*.default*/cookies.sqlite
+```
 
-Ignore pure analytics cookies: `_ga`, `_gcl_*`, `_gid`, `_fbp`, `_hjid`, `__utm*`.
-Focus on session-looking names: anything containing `session`, `token`, `auth`, `jwt`,
-`sid`, `access`, `refresh`, or the site's own name.
+Ignore analytics cookies: `_ga`, `_gcl_*`, `_gid`, `_fbp`, `_hjid`, `__utm*`.
+Target: any name containing `session`, `token`, `auth`, `jwt`, `sid`, `access`, `refresh`,
+or the site's own name.
 
-### 1c — Browsers and profiles to scan
+**What to use in API calls:** `Cookie: name=value; name2=value2`
 
-Check these browser application dirs (skip if not installed):
-- `Google/Chrome`, `Google/Chrome Beta`, `Google/Chrome Canary`
-- `Microsoft Edge`, `Microsoft Edge Beta`
-- `Arc/User Data`
-- `BraveSoftware/Brave-Browser`
-- `Chromium`
-- `Vivaldi`
-- `Opera Software/Opera Stable`
-- Firefox (all profiles matching `*.default*` or `*.default-release*`)
+---
 
-For each Chromium browser, scan these profiles: `Default`, `Profile 1`, `Profile 2`,
-`Profile 3` — stop at first missing one.
+### 1e — Extraction: Unknown / Custom
 
-### 1d — Identify auth scheme and test it
+If the bundle search found no known auth library, search for:
+- Any JWT-shaped values in localStorage (decode with `atob` — should parse as JSON with `exp` field)
+- API keys hardcoded in the bundle: `grep -oE '"apiKey"\s*:\s*"[A-Za-z0-9_-]{20,}"' bundle.js`
+- Custom auth headers used in fetch calls: `grep -oE 'X-[A-Za-z-]+-[Tt]oken|X-Api-Key|X-Auth' bundle.js`
 
-From what you found, determine how the site sends auth to its API.
-Try these in order until one gets a non-401 response from any API endpoint:
+Test the candidate against any API endpoint before assuming it works.
 
-1. JWT in POST body: `{ "auth": token }` or `{ "token": token }` or `{ "jwt": token }`
-2. Authorization header: `Authorization: Bearer <token>`
-3. Cookie header: `Cookie: name=value; name2=value2`
-4. Custom header (look for hints in key names): `X-Auth-Token`, `X-API-Key`, etc.
+---
 
-To find an API endpoint to test against, look in the page HTML for any fetch/XHR
-call or API base URL — even a partial one is enough to probe.
+### 1f — Confirm and report
 
-**Show me what you found in each store and which auth method works before proceeding.**
+Make one authenticated request to any API endpoint. Then state:
+
+```
+Auth system:   [Cognito / Firebase / session cookies / custom]
+Credential:    [what you extracted — token type and first 20 chars]
+Transport:     [Authorization: Bearer / Cookie: name=value / POST body field]
+Expiry:        [how long the token lasts]
+Refresh:       [see Phase 3 section: X]
+```
+
+**Do not proceed to Phase 2 until you have a confirmed working credential.**
 
 ---
 
