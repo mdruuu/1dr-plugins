@@ -1,7 +1,7 @@
 # Browser-to-Plugin Prompt
 
 A reusable prompt for building a 1dr plugin from any website you're logged into.
-The result is a single `index.ts` that plugs into `1dr` via the plugin registry.
+The result is a single `cli.ts` that plugs into `1dr` via the plugin registry.
 
 Usage: tell Claude "build me a 1dr plugin for [SITE URL]" — it will follow these phases automatically.
 
@@ -217,23 +217,26 @@ with `{ "grant_type": "refresh_token", "refresh_token": "..." }`
 Cookies don't usually need refresh logic — valid until the server invalidates them.
 Just re-scan the browser on failure.
 
-### Credential storage:
+### Credential storage
 
-Store in `1DR_CONFIG_DIR/plugins/<name>/config.json` (never in ~/.1dr/ root):
+Store in `~/.1dr/plugins/<name>/config.json` (never in `~/.1dr/` root):
+
 ```typescript
-const CONFIG_DIR = process.env['1DR_CONFIG_DIR'];
-const CONFIG = `${CONFIG_DIR}/plugins/<name>/config.json`;
+import { homedir } from 'os';
+import { join } from 'path';
+const PLUGIN_DIR = join(homedir(), '.1dr', 'plugins', NAME);
+const CONFIG = join(PLUGIN_DIR, 'config.json');
 ```
 
 For passwords/credentials needed for full re-auth:
 - macOS: `security add-generic-password -s "<name>-plugin" -a "<user>" -w "<password>"`
-- Linux fallback: `${CONFIG_DIR}/plugins/<name>/.credentials` with `chmod 600`
+- Linux fallback: `${PLUGIN_DIR}/.credentials` with `chmod 600`
 
 ---
 
 ## Phase 4 — Build the Plugin
 
-This is a 1dr plugin — a single `index.ts` that runs via `#!/usr/bin/env bun`.
+This is a 1dr plugin — a single `cli.ts` that runs via `#!/usr/bin/env bun`.
 Do NOT build a multi-file CLI. Everything goes in one file.
 
 ### Plugin contract (non-negotiable)
@@ -241,11 +244,12 @@ Do NOT build a multi-file CLI. Everything goes in one file.
 ```typescript
 #!/usr/bin/env bun
 
+import { homedir } from 'os';
+import { join } from 'path';
+
 const NAME = '<name>';
 const DESCRIPTION = '<specific description: data, source, format>';
-const TOKEN = process.env['1DR_TOKEN'];       // 1dr auth (rarely needed)
-const BASE_URL = process.env['1DR_BASE_URL']; // 1dr API base
-const CONFIG_DIR = process.env['1DR_CONFIG_DIR']; // ~/.1dr
+const PLUGIN_DIR = join(homedir(), '.1dr', 'plugins', NAME);
 
 const handlers: Record<string, (args: string[]) => Promise<void>> = {
   // add your commands here
@@ -262,7 +266,7 @@ if (command === '--summary') {
 
 if (command === '--help' || command === '-h' || !command) {
   console.log(`${NAME} — ${DESCRIPTION}\n`);
-  console.log(`Usage: 1dr ${NAME} <command> [options]\n`);
+  console.log(`Usage: ${NAME} <command> [options]\n`);
   console.log('Commands:');
   Object.keys(handlers).forEach(c => console.log(`  ${c}`));
   process.exit(!command ? 1 : 0);
@@ -277,11 +281,10 @@ if (handler) {
 }
 ```
 
-### Auth pattern (3-tier, inside index.ts)
+### Auth pattern (3-tier, inside cli.ts)
 
 ```typescript
-import { join } from 'path';
-const CONFIG = join(CONFIG_DIR!, 'plugins', NAME, 'config.json');
+const CONFIG = join(PLUGIN_DIR, 'config.json');
 
 async function getToken(): Promise<string> {
   // 1. Check cache
@@ -308,9 +311,8 @@ async function getToken(): Promise<string> {
 import { Database } from 'bun:sqlite';
 import { mkdirSync } from 'fs';
 
-const CACHE_DIR = join(CONFIG_DIR!, 'plugins', NAME);
-mkdirSync(CACHE_DIR, { recursive: true });
-const db = new Database(join(CACHE_DIR, 'cache.db'));
+mkdirSync(PLUGIN_DIR, { recursive: true });
+const db = new Database(join(PLUGIN_DIR, 'cache.db'));
 db.run('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expires_at INTEGER)');
 
 function getCached<T>(key: string): T | null {
@@ -331,7 +333,7 @@ function setCached(key: string, value: unknown, ttlSeconds: number): void {
 - **stderr only** — all errors go to `console.error()`
 - **Exit codes** — 0 = success, non-zero = error
 - **Format** — markdown preferred; JSON only if the agent will parse it programmatically
-- **Never** write to ~/.1dr/ root; only to `1DR_CONFIG_DIR/plugins/<name>/`
+- **Never** write to `~/.1dr/` root; only to `~/.1dr/plugins/<name>/`
 
 **Preferred output format:**
 ```markdown
@@ -345,7 +347,7 @@ function setCached(key: string, value: unknown, ttlSeconds: number): void {
 
 ### Error handling
 
-- 401/403 → `"Not authenticated. Run: 1dr <name> auth"`
+- 401/403 → `"Not authenticated. Run: <name> login"`
 - 404 → `"Not found: <id>"`
 - 429 → `"Rate limited — try again in Xs"`
 - Network error → `"Could not reach <service>. Check your connection."`
@@ -353,20 +355,28 @@ function setCached(key: string, value: unknown, ttlSeconds: number): void {
 
 ---
 
-## Phase 5 — Install and Verify
+## Phase 5 — Test and Release
 
 ```bash
-# Check before installing:
-1dr plugin run ./index.ts --summary    # verify metadata format
-1dr plugin run ./index.ts --help       # verify help text
-1dr plugin run ./index.ts list         # test with real env vars
+# Test locally before releasing
+bun run cli.ts --summary      # verify metadata format
+bun run cli.ts --help         # verify help text
+bun run cli.ts <command>      # test with real data
 
-# Install:
-1dr plugin install ~/.1dr/plugins/<name>
+# Link for manual binary testing
+bun link   # makes 'your-plugin' available in PATH
 
-# Sync skill file so agents can discover this plugin:
-1dr skill-sync
+# Release (compiles all platforms, creates GitHub release, bumps registry version)
+./scripts/release.sh patch
 ```
+
+After release, users install via:
+```bash
+1dr plugin install your-plugin          # public registry
+1dr plugin install <private-url>        # private registry
+```
+
+The skill file updates automatically on next interactive startup.
 
 ---
 
