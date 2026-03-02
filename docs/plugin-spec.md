@@ -130,7 +130,7 @@ Each plugin handles its own auth independently. Common patterns:
 
 - **Browser cookie extraction**: read from `~/Library/Application Support/...` or use `get-cookies-txt`
 - **Keychain**: use the OS keychain via `security find-generic-password`
-- **Config file**: store in `~/.1dr/plugins/<name>/config.json`
+- **Config file**: store in `~/.config/<name>-cli/config.json`
 
 1dr has no auth integration — don't depend on it.
 
@@ -138,15 +138,15 @@ Each plugin handles its own auth independently. Common patterns:
 
 ## Config and cache storage
 
-Store all plugin data under `~/.1dr/plugins/<name>/`. Do not write to `~/.1dr/` root.
+Each plugin manages its own config in its own directory. Conventional location is `~/.config/<name>-cli/`:
 
 ```typescript
 import { homedir } from 'os';
 import { join } from 'path';
 
-const PLUGIN_DIR = join(homedir(), '.1dr', 'plugins', NAME);
-const CONFIG = join(PLUGIN_DIR, 'config.json');
-const CACHE_DB = join(PLUGIN_DIR, 'cache.db');
+const CONFIG_DIR = join(homedir(), '.config', `${NAME}-cli`);
+const CONFIG = join(CONFIG_DIR, 'config.json');
+const CACHE_DB = join(CONFIG_DIR, 'cache.db');
 ```
 
 ---
@@ -194,4 +194,4 @@ Before publishing a plugin:
 - [ ] Registry entry has `name`, `description`, `install`, `version`
 - [ ] Release script bumps `version` in registry on each release
 - [ ] Auth failure prints actionable message to stderr
-- [ ] Config/cache stored in `~/.1dr/plugins/<name>/`
+- [ ] Config/cache stored in a consistent location (e.g. `~/.config/<name>-cli/`)
