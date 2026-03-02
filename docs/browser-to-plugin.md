@@ -1,7 +1,6 @@
 # Browser-to-Plugin Prompt
 
 A reusable prompt for building a 1dr plugin from any website you're logged into.
-The result is a single `cli.ts` that plugs into `1dr` via the plugin registry.
 
 Usage: tell Claude "build me a 1dr plugin for [SITE URL]" — it will follow these phases automatically.
 
@@ -11,8 +10,15 @@ Usage: tell Claude "build me a 1dr plugin for [SITE URL]" — it will follow the
 I want to build a 1dr plugin for this website: [PASTE URL]
 
 I am logged into this site in my browser. Build me a fully working plugin that fetches
-data from it programmatically. Do NOT ask me to open DevTools, paste curl commands,
-or do anything manually — figure everything out from the URL alone.
+data from it programmatically, and set up the full release pipeline so it can be
+distributed via the 1dr plugin registry. Do NOT ask me to open DevTools, paste curl
+commands, or do anything manually — figure everything out from the URL alone.
+
+Ask me only these two things before starting:
+1. What should the binary name be? (e.g. tikr, substack — lowercase, no spaces)
+2. Should this be public (anyone can install) or private (invite only)?
+
+Then proceed through all phases automatically. Ask for help only when genuinely stuck.
 
 ---
 
@@ -170,8 +176,8 @@ Before writing any code, stop and present your findings.
 
 **What I propose to build:**
 - Suggest natural CLI commands based on the data available, e.g.:
-  `1dr <name> AAPL` → snapshot view
-  `1dr <name> AAPL history` → historical data
+  `<name> AAPL` → snapshot view
+  `<name> AAPL history` → historical data
 - Flag anything technically complex vs straightforward
 - Suggest a sensible default command (what should happen with no subcommand)
 
@@ -214,94 +220,83 @@ with `{ "grant_type": "refresh_token", "refresh_token": "..." }`
 
 ### If the site uses session cookies:
 
-Cookies don't usually need refresh logic — valid until the server invalidates them.
+Cookies don't usually need refresh logic — valid until the server invalidated them.
 Just re-scan the browser on failure.
 
 ### Credential storage
 
-Store in `~/.1dr/plugins/<name>/config.json` (never in `~/.1dr/` root):
+Store everything in `~/.config/<name>-cli/` (the tool's own config dir):
 
 ```typescript
 import { homedir } from 'os';
 import { join } from 'path';
-const PLUGIN_DIR = join(homedir(), '.1dr', 'plugins', NAME);
-const CONFIG = join(PLUGIN_DIR, 'config.json');
+const CONFIG_DIR = join(homedir(), '.config', '<name>-cli');
+const CONFIG = join(CONFIG_DIR, 'config.json');
 ```
 
 For passwords/credentials needed for full re-auth:
-- macOS: `security add-generic-password -s "<name>-plugin" -a "<user>" -w "<password>"`
-- Linux fallback: `${PLUGIN_DIR}/.credentials` with `chmod 600`
+- macOS: `security add-generic-password -s "<name>-cli" -a "<user>" -w "<password>"`
+- Linux fallback: `${CONFIG_DIR}/.credentials` with `chmod 600`
 
 ---
 
 ## Phase 4 — Build the Plugin
 
-This is a 1dr plugin — a single `cli.ts` that runs via `#!/usr/bin/env bun`.
-Do NOT build a multi-file CLI. Everything goes in one file.
+### File structure
 
-### Plugin contract (non-negotiable)
+Split into multiple files for clarity — they compile to a single binary.
+
+```
+<name>-cli/
+├── cli.ts        ← entry point: --summary, --help, command dispatch
+├── <name>.ts     ← API calls and data fetching
+├── auth.ts       ← token extraction and refresh logic
+├── cache.ts      ← SQLite cache helpers
+├── views.ts      ← output formatting
+├── package.json
+└── scripts/
+    ├── release.sh
+    └── install.sh
+```
+
+### CLI contract (non-negotiable)
+
+`cli.ts` must handle `--summary` and `--help` before any other logic:
 
 ```typescript
 #!/usr/bin/env bun
 
-import { homedir } from 'os';
-import { join } from 'path';
-
 const NAME = '<name>';
-const DESCRIPTION = '<specific description: data, source, format>';
-const PLUGIN_DIR = join(homedir(), '.1dr', 'plugins', NAME);
-
-const handlers: Record<string, (args: string[]) => Promise<void>> = {
-  // add your commands here
-};
+const DESCRIPTION = '<specific description: data source, what it returns>';
 
 const args = process.argv.slice(2);
-const command = args[0];
 
-if (command === '--summary') {
+if (args[0] === '--summary') {
   console.log(`DESCRIPTION: ${DESCRIPTION}`);
-  console.log(`COMMANDS: ${Object.keys(handlers).join(', ')}`);
+  console.log(`COMMANDS: cmd1, cmd2, cmd3`);
   process.exit(0);
 }
 
-if (command === '--help' || command === '-h' || !command) {
+if (args[0] === '--help' || args[0] === '-h') {
   console.log(`${NAME} — ${DESCRIPTION}\n`);
   console.log(`Usage: ${NAME} <command> [options]\n`);
   console.log('Commands:');
-  Object.keys(handlers).forEach(c => console.log(`  ${c}`));
-  process.exit(!command ? 1 : 0);
-}
-
-const handler = handlers[command];
-if (handler) {
-  await handler(args.slice(1));
-} else {
-  console.error(`Unknown command: ${command}`);
-  process.exit(1);
+  // list each command with a one-line description
+  process.exit(0);
 }
 ```
 
-### Auth pattern (3-tier, inside cli.ts)
+### Auth error messages
+
+Every fetch function must produce actionable errors on 401/403:
 
 ```typescript
-const CONFIG = join(PLUGIN_DIR, 'config.json');
-
-async function getToken(): Promise<string> {
-  // 1. Check cache
-  try {
-    const cached = JSON.parse(await Bun.file(CONFIG).text());
-    if (cached.token && cached.expiresAt > Date.now()) return cached.token;
-    // 2. Refresh if possible
-    if (cached.refreshToken) {
-      const fresh = await refreshToken(cached.refreshToken);
-      await saveConfig(fresh);
-      return fresh.token;
-    }
-  } catch {}
-  // 3. Full re-auth from browser scan or stored credentials
-  const found = await extractFromBrowser();
-  await saveConfig(found);
-  return found.token;
+if (!res.ok) {
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(`Auth expired. Run: ${NAME} setup`);
+  }
+  const text = await res.text().catch(() => '');
+  throw new Error(`API error ${res.status}: ${text.slice(0, 200)}`);
 }
 ```
 
@@ -311,8 +306,8 @@ async function getToken(): Promise<string> {
 import { Database } from 'bun:sqlite';
 import { mkdirSync } from 'fs';
 
-mkdirSync(PLUGIN_DIR, { recursive: true });
-const db = new Database(join(PLUGIN_DIR, 'cache.db'));
+mkdirSync(CONFIG_DIR, { recursive: true });
+const db = new Database(join(CONFIG_DIR, 'cache.db'));
 db.run('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expires_at INTEGER)');
 
 function getCached<T>(key: string): T | null {
@@ -329,54 +324,248 @@ function setCached(key: string, value: unknown, ttlSeconds: number): void {
 
 ### Output rules
 
-- **stdout only** — all data output goes to stdout
-- **stderr only** — all errors go to `console.error()`
+- **stdout only** — all data output
+- **stderr only** — all errors via `console.error()`
 - **Exit codes** — 0 = success, non-zero = error
-- **Format** — markdown preferred; JSON only if the agent will parse it programmatically
-- **Never** write to `~/.1dr/` root; only to `~/.1dr/plugins/<name>/`
-
-**Preferred output format:**
-```markdown
-# Apple Inc (AAPL) — Estimates
-
-| Metric  | FY2025E | FY2026E |
-|---------|---------|---------|
-| Revenue | $409.0B | $432.5B |
-| EPS     | $7.42   | $8.01   |
-```
-
-### Error handling
-
-- 401/403 → `"Not authenticated. Run: <name> login"`
-- 404 → `"Not found: <id>"`
-- 429 → `"Rate limited — try again in Xs"`
-- Network error → `"Could not reach <service>. Check your connection."`
-- Parsing failure → `"Parsing failed — site layout may have changed."`
+- **Format** — markdown preferred; pipe-delimited tables for structured data
 
 ---
 
-## Phase 5 — Test and Release
+## Phase 5 — Set Up the Release Pipeline
+
+Do this immediately after the CLI works locally. Do not wait until later.
+
+### 5a — One question for the user
+
+"Does the `mdruuu/<name>-releases` GitHub repo already exist?"
+
+If not: `gh repo create mdruuu/<name>-releases --public`
+
+### 5b — package.json scripts block
+
+```json
+{
+  "name": "<name>-cli",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "bun run cli.ts",
+    "build": "bun build ./cli.ts --outdir ./dist --target bun",
+    "compile": "bun build ./cli.ts --compile --outfile <name>",
+    "compile:darwin-arm64": "bun build ./cli.ts --compile --target bun-darwin-arm64 --outfile <name>-darwin-arm64",
+    "compile:darwin-x64":   "bun build ./cli.ts --compile --target bun-darwin-x64   --outfile <name>-darwin-x64",
+    "compile:linux-x64":    "bun build ./cli.ts --compile --target bun-linux-x64    --outfile <name>-linux-x64",
+    "compile:linux-arm64":  "bun build ./cli.ts --compile --target bun-linux-arm64  --outfile <name>-linux-arm64",
+    "compile:windows-x64":  "bun build ./cli.ts --compile --target bun-windows-x64  --outfile <name>-windows-x64.exe",
+    "compile:all": "bun run compile:darwin-arm64 && bun run compile:darwin-x64 && bun run compile:linux-x64 && bun run compile:linux-arm64 && bun run compile:windows-x64",
+    "checkpoint": "git add . && git commit -m checkpoint && npm version patch && bun run build && bun link",
+    "release":       "./scripts/release.sh patch",
+    "release:minor": "./scripts/release.sh minor",
+    "release:major": "./scripts/release.sh major"
+  }
+}
+```
+
+### 5c — scripts/release.sh
+
+Use `mdruuu/1dr-plugins` for public, `mdruuu/1dr-plugins-x` for private:
 
 ```bash
-# Test locally before releasing
-bun run cli.ts --summary      # verify metadata format
-bun run cli.ts --help         # verify help text
-bun run cli.ts <command>      # test with real data
+#!/bin/bash
+set -e
 
-# Link for manual binary testing
-bun link   # makes 'your-plugin' available in PATH
+BUMP="${1:-patch}"
+NAME="<name>"
+RELEASES_REPO="mdruuu/<name>-releases"
+REGISTRY_REPO="mdruuu/1dr-plugins"   # or 1dr-plugins-x for private
 
-# Release (compiles all platforms, creates GitHub release, bumps registry version)
+npm version "$BUMP"
+VERSION=$(node -p "require('./package.json').version")
+TAG="v$VERSION"
+
+echo ""
+echo "  Building $TAG..."
+echo ""
+
+bun run compile:all
+
+shasum -a 256 \
+  ${NAME}-darwin-arm64 \
+  ${NAME}-darwin-x64 \
+  ${NAME}-linux-x64 \
+  ${NAME}-linux-arm64 \
+  ${NAME}-windows-x64.exe \
+  > checksums.txt
+
+git push && git push --tags
+
+gh release create "$TAG" \
+  ${NAME}-darwin-arm64 \
+  ${NAME}-darwin-x64 \
+  ${NAME}-linux-x64 \
+  ${NAME}-linux-arm64 \
+  ${NAME}-windows-x64.exe \
+  checksums.txt \
+  --repo "$RELEASES_REPO" \
+  --title "$TAG" \
+  --notes "${NAME} $TAG"
+
+rm -f ${NAME}-darwin-arm64 ${NAME}-darwin-x64 ${NAME}-linux-x64 ${NAME}-linux-arm64 ${NAME}-windows-x64.exe checksums.txt
+
+# Bump version in 1dr plugin registry
+SHA=$(gh api "repos/$REGISTRY_REPO/contents/registry.json" --jq '.sha')
+CURRENT=$(gh api "repos/$REGISTRY_REPO/contents/registry.json" --jq '.content' | base64 --decode)
+UPDATED=$(echo "$CURRENT" | jq --arg v "$VERSION" '(.plugins[] | select(.name == "'"$NAME"'")).version = $v')
+gh api "repos/$REGISTRY_REPO/contents/registry.json" \
+  --method PUT \
+  -f message="bump $NAME to v$VERSION" \
+  -f content="$(echo "$UPDATED" | base64 | tr -d '\n')" \
+  -f sha="$SHA"
+
+echo ""
+echo "  Released $TAG"
+echo ""
+```
+
+`chmod +x scripts/release.sh`
+
+### 5d — scripts/install.sh
+
+```bash
+#!/usr/bin/env bash
+# <name> installer
+# Usage: curl -fsSL https://raw.githubusercontent.com/mdruuu/<name>-releases/main/install.sh | bash
+
+set -euo pipefail
+
+REPO="mdruuu/<name>-releases"
+BINARY="<name>"
+INSTALL_DIR="$HOME/.local/bin"
+
+info()    { printf "  \033[34m•\033[0m %s\n" "$*"; }
+success() { printf "  \033[32m✓\033[0m %s\n" "$*"; }
+warn()    { printf "  \033[33m!\033[0m %s\n" "$*"; }
+error()   { printf "  \033[31m✗\033[0m %s\n" "$*" >&2; exit 1; }
+
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+
+case "$OS" in
+  darwin) OS="darwin" ;;
+  linux)  OS="linux"  ;;
+  *)      error "Unsupported OS: $OS" ;;
+esac
+
+case "$ARCH" in
+  x86_64)        ARCH="x64"   ;;
+  arm64|aarch64) ARCH="arm64" ;;
+  *)             error "Unsupported architecture: $ARCH" ;;
+esac
+
+ASSET="${BINARY}-${OS}-${ARCH}"
+
+info "Fetching latest release..."
+RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")
+
+LATEST=$(echo "$RELEASE_JSON" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+[ -z "$LATEST" ] && error "Could not determine latest release"
+
+URL=$(echo "$RELEASE_JSON" | grep "browser_download_url" | grep "/${ASSET}\"" | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/')
+[ -z "$URL" ] && error "No asset found for ${ASSET} in ${LATEST}"
+
+CHECKSUM_URL=$(echo "$RELEASE_JSON" | grep "browser_download_url" | grep '/checksums.txt"' | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/' || true)
+
+info "Latest: $LATEST"
+
+TMP=$(mktemp)
+info "Downloading ${ASSET}..."
+curl -fsSL "$URL" -o "$TMP"
+
+if [ -n "$CHECKSUM_URL" ]; then
+  CHECKSUMS=$(curl -fsSL "$CHECKSUM_URL")
+  EXPECTED=$(echo "$CHECKSUMS" | grep " ${ASSET}$" | awk '{print $1}')
+  if [ -n "$EXPECTED" ]; then
+    if command -v shasum &>/dev/null; then
+      ACTUAL=$(shasum -a 256 "$TMP" | awk '{print $1}')
+    else
+      ACTUAL=$(sha256sum "$TMP" | awk '{print $1}')
+    fi
+    if [ "$ACTUAL" != "$EXPECTED" ]; then
+      rm -f "$TMP"
+      error "Checksum mismatch for ${ASSET}"
+    fi
+  else
+    warn "No checksum entry for ${ASSET}; skipping verification"
+  fi
+else
+  warn "No checksums.txt in release; skipping verification"
+fi
+
+mkdir -p "$INSTALL_DIR"
+mv "$TMP" "$INSTALL_DIR/$BINARY"
+chmod +x "$INSTALL_DIR/$BINARY"
+
+success "Installed $BINARY to $INSTALL_DIR"
+
+if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
+  warn "'$INSTALL_DIR' is not in your PATH."
+  warn "Add to your shell profile: export PATH=\"\$HOME/.local/bin:\$PATH\""
+fi
+
+printf "\n"
+printf "  \033[32m%s installed!\033[0m\n\n" "$BINARY"
+printf "  Run: %s --help\n\n" "$BINARY"
+```
+
+`chmod +x scripts/install.sh`
+
+Push `install.sh` to the releases repo root so the install URL works:
+```bash
+gh api repos/mdruuu/<name>-releases/contents/install.sh \
+  --method PUT \
+  -f message="add installer" \
+  -f content="$(cat scripts/install.sh | base64 | tr -d '\n')" \
+  --jq '.commit.sha'
+```
+
+### 5e — Add the registry entry
+
+```bash
+REGISTRY_REPO="mdruuu/1dr-plugins"   # or 1dr-plugins-x for private
+SHA=$(gh api "repos/$REGISTRY_REPO/contents/registry.json" --jq '.sha')
+CURRENT=$(gh api "repos/$REGISTRY_REPO/contents/registry.json" --jq '.content' | base64 --decode)
+NEW_ENTRY=$(jq -n \
+  --arg name "<name>" \
+  --arg desc "<one-line description matching --summary DESCRIPTION>" \
+  --arg install "curl -fsSL https://raw.githubusercontent.com/mdruuu/<name>-releases/main/install.sh | bash" \
+  --arg homepage "https://github.com/mdruuu/<name>-releases" \
+  '{name: $name, description: $desc, install: $install, homepage: $homepage, feedback: "hello@actuallyprettyuseful.com", version: "1.0.0"}')
+UPDATED=$(echo "$CURRENT" | jq --argjson entry "$NEW_ENTRY" '.plugins += [$entry]')
+gh api "repos/$REGISTRY_REPO/contents/registry.json" \
+  --method PUT \
+  -f message="add <name> plugin" \
+  -f content="$(echo "$UPDATED" | base64 | tr -d '\n')" \
+  -f sha="$SHA"
+```
+
+### 5f — First release
+
+```bash
+git init && git add . && git commit -m "initial"
+gh repo create mdruuu/<name>-cli --private   # or --public
+git remote add origin git@github.com:mdruuu/<name>-cli.git
+git push -u origin main
+
 ./scripts/release.sh patch
 ```
 
-After release, users install via:
-```bash
-1dr plugin install your-plugin          # public registry
-1dr plugin install <private-url>        # private registry
-```
+### 5g — Verify end to end
 
-The skill file updates automatically on next interactive startup.
+```bash
+1dr plugin install <name>            # public
+1dr plugin install <private-url>     # private
+<name> --help
+<name> --summary
+```
 
 ---
 
@@ -388,6 +577,7 @@ The skill file updates automatically on next interactive startup.
 - **Can't find endpoints in main bundle**: site may use code splitting —
   check for route-specific JS chunks, look for dynamic `import()` calls
 - **Cookie decryption fails on Linux**: try `"peanuts"` as the hardcoded password
+- **gh release create fails**: check the releases repo exists and you have push access
 
 When you do need to ask the user, be specific:
 - "I found two tokens — `accessToken` and `idToken`. Can you check DevTools → Network
@@ -395,5 +585,5 @@ When you do need to ask the user, be specific:
   name and first 20 chars of the value."
 
 Start with Phase 1 now. Scan localStorage and cookies, show every auth-looking value,
-confirm which works against the API, then proceed automatically.
+confirm which works against the API, then proceed automatically through all phases.
 ```
