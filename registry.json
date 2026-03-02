@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "plugins": [
+    {
+      "name": "substack",
+      "description": "Browse your Substack inbox, subscriptions, and notes feed",
+      "install": "curl -fsSL https://raw.githubusercontent.com/mdruuu/substack-cli/main/scripts/install.sh | bash",
+      "homepage": "https://github.com/mdruuu/substack-cli",
+      "feedback": "hello@actuallyprettyuseful.com"
+    }
+  ]
+}
