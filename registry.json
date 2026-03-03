@@ -6,7 +6,8 @@
       "description": "Browse your Substack inbox, subscriptions, and notes feed",
       "install": "curl -fsSL https://raw.githubusercontent.com/mdruuu/substack-releases/main/install.sh | bash",
       "homepage": "https://github.com/mdruuu/substack-releases",
-      "feedback": "hello@actuallyprettyuseful.com"
+      "feedback": "hello@actuallyprettyuseful.com",
+      "version": "1.1.3"
     }
   ]
 }
